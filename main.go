@@ -13,8 +13,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-
-	"github.com/lfourky/definitely-not-an-illegal-book-downloader/workers"
 )
 
 var (
@@ -43,7 +41,7 @@ var (
 	// Provide page urls to this channel in order for them to get scanned for the target (download) links
 	bookPages chan string
 
-	workPool chan workers.Work
+	workPool chan Work
 
 	slowModeWG sync.WaitGroup
 	workWG     sync.WaitGroup
@@ -90,7 +88,7 @@ func main() {
 		}
 	}
 
-	workPool = workers.InitializeWorkers(int(*numWorkers), bookLimitPerPage)
+	workPool = InitializeWorkers(int(*numWorkers), bookLimitPerPage)
 
 	bookPages = make(chan string, bookLimitPerPage)
 	go processBookPages()
@@ -228,7 +226,7 @@ func processBookPages() {
 
 		bookFilePath := path.Join(bookDirPath, downloadURL[lastSlashIndex:])
 
-		workPool <- workers.Work{URL: downloadURL, Filename: bookFilePath, SlowModeSync: getSlowModeWaitGroup(), WorkSync: &workWG}
+		workPool <- Work{URL: downloadURL, Filename: bookFilePath, SlowModeSync: getSlowModeWaitGroup(), WorkSync: &workWG}
 	}
 }
 
