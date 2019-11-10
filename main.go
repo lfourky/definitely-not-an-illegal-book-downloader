@@ -10,10 +10,15 @@ import (
 	"path"
 	"regexp"
 	"runtime"
-	"strconv"
 	"strings"
 	"sync"
 )
+
+type book struct {
+	url           string
+	category      string
+	downloadLinks []string
+}
 
 var (
 	numWorkers   = flag.Uint("workerCount", 10, "Number of concurrent workers")
@@ -29,19 +34,18 @@ const (
 
 	bookLimitPerPage = 10
 
+	baseURL = "http://www.allitebooks.com/page/"
+
 	// This is where the books will be stored
 	baseDirPath = "allitebooks"
 
-	lastPageNumberFile = "lastpagenumber.txt"
+	// lastPageNumberFile = "lastpagenumber.txt"
 
 	defaultCategoryName = "Random"
 )
 
 var (
-	// Provide page urls to this channel in order for them to get scanned for the target (download) links
-	bookPages chan string
-
-	workPool chan Work
+	// workPool chan Work
 
 	slowModeWG sync.WaitGroup
 	workWG     sync.WaitGroup
@@ -50,13 +54,13 @@ var (
 var (
 	// This will provide us with individual book page links (not the actual download link this time,
 	// but the actual download link for a single book will be on that page).
-	rgxBookPage = regexp.MustCompile(`<h2 class="entry-title"><a href="(.*)" rel="bookmark"`)
+	rgxBookPage = regexp.MustCompile(`<h2 class="entry-title"><a href="(?P<PAGE>.*?)"`)
 
-	// This will provide us with the actual download link
-	rgxBookDownloadLink = regexp.MustCompile(`<a href="(http://file.allitebooks.com/.*.pdf)" target="_blank">`)
+	// This will provide us with the actual download link.
+	rgxBookDownloadLink = regexp.MustCompile(`<a href="(?P<LINK>http://file\.allitebooks\.com/.+?(\.(?:pdf|epub)))" target="_blank">`)
 
-	// This will provide us with the category for the book we found
-	rgxBookCategoryFinder = regexp.MustCompile(`<dt>Category:</dt>.*>(.*)</a></dd>`)
+	// This will provide us with the category for the book we found.
+	rgxBookCategoryFinder = regexp.MustCompile(`rel="category"\s*?>(?P<CATEGORY>.*?)</a>`)
 )
 
 func main() {
@@ -67,73 +71,45 @@ func main() {
 		runtime.GOMAXPROCS(runtime.NumCPU())
 	}
 
-	if *continueWork {
-		data, err := ioutil.ReadFile(lastPageNumberFile)
-		if err == nil {
-			lastPageNumber, err := strconv.Atoi(string(data))
-			if err != nil {
-				log.Printf("Invalid content in %s: %s", lastPageNumberFile, data)
-				os.Exit(1)
-			}
-
-			// If we've made it this far, override the startingPage param
-			*startingPage = lastPageNumber
-		}
+	if err := os.MkdirAll(baseDirPath, os.ModePerm); err != nil {
+		log.Fatalf("Error creating base directory: %s", err)
 	}
 
-	if _, err := os.Stat(baseDirPath); os.IsNotExist(err) {
-		if err := os.Mkdir(baseDirPath, os.ModePerm); err != nil {
-			log.Printf("Error creating base directory: %s", err)
-			os.Exit(1)
-		}
-	}
+	updateLinkDatabaseHeaders()
 
-	workPool = InitializeWorkers(int(*numWorkers), bookLimitPerPage)
+	chanBooks := make(chan book, 100)
+	quitChanBooks := make(chan bool)
+	go processBooks(chanBooks, nil, quitChanBooks)
 
-	bookPages = make(chan string, bookLimitPerPage)
-	go processBookPages()
+	quitChanBookPages := make(chan bool)
+	chanBookPages := make(chan string, 100)
+	go processIndividualBookPages(chanBookPages, chanBooks, quitChanBookPages)
 
-	baseURL := "http://www.allitebooks.com/page/"
+	fetchIndividualBookPages(*startingPage, chanBookPages, []chan bool{quitChanBookPages, quitChanBooks})
+}
 
-	// Infinite loop to get through all the pages; stop only on errors or if previously defined page end content is encountered
-	for currentPageNumber := *startingPage; ; currentPageNumber++ {
+// Goes through each page on the website and gather individual book pages by sending them to bookPages channel.
+func fetchIndividualBookPages(startFrom int, bookPages chan<- string, quitChans []chan bool) {
+	// Infinite loop that breaks if no books were found on a page.
+	for currentPageNumber := startFrom; ; currentPageNumber++ {
 		currentURL := fmt.Sprintf("%s%d", baseURL, currentPageNumber)
-		response, err := http.Get(currentURL)
+
+		// Book index page contains around 10 individual books.
+		bookIndexPage, err := http.Get(currentURL)
 		if err != nil {
-			//Shouldn't really continue if we get an error here
-			log.Printf("Error fetching the main page: %s", err)
-			os.Exit(1)
+			log.Fatalf("Error fetching the book index page: %s", err)
 		}
 
-		log.Printf("\n\n")
-		log.Printf("----------------------")
-		log.Printf("Currently at %s", currentURL)
-		log.Printf("----------------------\n\n")
-
-		sourceBytes, err := ioutil.ReadAll(response.Body)
+		sourceBytes, err := ioutil.ReadAll(bookIndexPage.Body)
 		if err != nil {
-			log.Printf("Error reading the source code from the main page: %s", err)
-			continue
+			log.Fatalf("Error reading the source code from the book index page: %s", err)
 		}
 
-		response.Body.Close()
-
-		sourceCode := string(sourceBytes)
-		if strings.Contains(sourceCode, endReachedSentence) {
-			log.Printf("The website reports that this page (%s) doesn't contain any books.", currentURL)
-			break
+		if err := bookIndexPage.Body.Close(); err != nil {
+			log.Printf("Error closing bookIndexPage's response body: %s", err)
 		}
 
-		if !*fastMode {
-			// Before we proceed (and only in slow mode), let's update the lastPageNumber file
-			err = ioutil.WriteFile(lastPageNumberFile, []byte(strconv.Itoa(currentPageNumber)), os.ModePerm)
-			if err != nil {
-				log.Printf("Error writing to %s: %s", lastPageNumberFile, err)
-				break
-			}
-		}
-
-		// Alright, it seems like we might have some books here!
+		// TODO: extract named capture group
 		match := rgxBookPage.FindAllSubmatch(sourceBytes, -1)
 		individualBookPages := make([]string, 0, 10)
 		for i := 0; i < 10 && i < len(match); i++ {
@@ -143,91 +119,156 @@ func main() {
 		}
 
 		if len(individualBookPages) < 1 {
-			log.Printf("Couldn't find any books on this page: (%s)", currentURL)
+			log.Printf("Couldn't find any books on page: (%s)", currentURL)
 			break
 		}
 
-		// Cool! We've made it this far, which means we've found some book pages.
-
-		if !*fastMode {
-			// First, let's allow only 1 page to be downloaded at time, to ensure corectness if a program is stopped at some point
-			// and then rerun with --continue flag
-			slowModeWG.Add(len(individualBookPages))
-		}
-
-		// Increment this counter, since we want to wait for all the book to finish downloading before the program exits.
-		workWG.Add(len(individualBookPages))
-
-		// Let's send them off to a bookPage channel and process them from there, but continue
-		// fetching more book pages here as well (unless we're processing 10 books at this very moment)
-		for _, bookPage := range individualBookPages {
-			bookPages <- bookPage
-		}
-
-		if !*fastMode {
-			log.Printf("Waiting for page [%d] to finish downloading all the books...", currentPageNumber)
-			slowModeWG.Wait()
+		for _, page := range individualBookPages {
+			bookPages <- page
 		}
 	}
 
-	log.Print("Waiting for all the book to finish downloading.")
-	workWG.Wait()
-	log.Print("All done! Enjoy and don't be lazy. Actually read some of them. :)")
+	for _, quitChan := range quitChans {
+		quitChan <- true
+	}
 }
 
-func processBookPages() {
+func processIndividualBookPages(bookPages <-chan string, books chan<- book, quitChan <-chan bool) {
 	for {
-		bookPage, ok := <-bookPages
-		if !ok {
-			return
-		}
-
-		//Process them further untill we get the download link (which is our goal here)
-		response, err := http.Get(bookPage)
-		if err != nil {
-			//Shouldn't really continue if we get an error here
-			log.Printf("Error fetching a book page %s - %s", bookPage, err)
-			continue
-		}
-
-		sourceBytes, err := ioutil.ReadAll(response.Body)
-		if err != nil {
-			log.Printf("Error reading the source code from the book page: %s", err)
-			continue
-		}
-
-		response.Body.Close()
-
-		match := rgxBookDownloadLink.FindSubmatch(sourceBytes)
-		if len(match) == 0 {
-			continue
-		}
-
-		// Bingo! We've got a book download URL. Let's download/process it in another place, and continue with what we're doing here.
-		downloadURL := string(match[1])
-
-		// Wait! Before that, let's also discover the category so we can place it in the corresponding directory.
-		category := defaultCategoryName
-		categoryMatch := rgxBookCategoryFinder.FindSubmatch(sourceBytes)
-		if len(categoryMatch) != 0 {
-			category = strings.Replace(string(categoryMatch[1]), "&amp;", "&", -1)
-		}
-
-		// Create the directory structure for a book to be stored. For example: allitebooks/databases/some-book-file.pdf
-		bookDirPath := path.Join(baseDirPath, category)
-		if _, err := os.Stat(bookDirPath); os.IsNotExist(err) {
-			if err := os.Mkdir(bookDirPath, os.ModePerm); err != nil {
-				log.Printf("Error creating book (sub)directory: %s", err)
-				os.Exit(1)
+		select {
+		case page := <-bookPages:
+			b := book{
+				url: page,
 			}
+
+			response, err := http.Get(b.url)
+			if err != nil {
+				log.Printf("Error fetching book page %s - %s", b.url, err)
+				continue
+			}
+
+			sourceBytes, err := ioutil.ReadAll(response.Body)
+			if err != nil {
+				log.Printf("Error reading the source code from book page: %s", err)
+				continue
+			}
+
+			if err := response.Body.Close(); err != nil {
+				log.Printf("Error closing response body for book page %s - %s", b.url, err)
+			}
+
+			downloadLinks := extractBookDownloadLinks(string(sourceBytes), rgxBookDownloadLink)
+			if len(downloadLinks) == 0 {
+				continue
+			}
+
+			category := defaultCategoryName
+			categoryMatch := rgxBookCategoryFinder.FindSubmatch(sourceBytes)
+			if len(categoryMatch) != 0 {
+				category = strings.Replace(string(categoryMatch[1]), "&amp;", "&", -1)
+			}
+			b.category = category
+
+			b.downloadLinks = make([]string, len(downloadLinks))
+			for i, link := range downloadLinks {
+				b.downloadLinks[i] = link
+			}
+
+			// Send to books chan for further processing.
+			books <- b
+
+		case <-quitChan:
+			log.Printf("QUIT done processing individual book pages")
+			return // todo rethink?
 		}
-
-		lastSlashIndex := strings.LastIndex(downloadURL, "/")
-
-		bookFilePath := path.Join(bookDirPath, downloadURL[lastSlashIndex:])
-
-		workPool <- Work{URL: downloadURL, Filename: bookFilePath, SlowModeSync: getSlowModeWaitGroup(), WorkSync: &workWG}
 	}
+}
+
+func processBooks(books <-chan book, workers chan bool, quitChan <-chan bool) {
+	createdSubdirectories := map[string]bool{}
+
+	for {
+		select {
+		case b := <-books:
+			bookDirPath := path.Join(baseDirPath, b.category)
+			if exists := createdSubdirectories[bookDirPath]; !exists {
+				if err := os.MkdirAll(bookDirPath, os.ModePerm); err != nil {
+					log.Fatalf("Error creating book (sub)directory: %s", err)
+				}
+				createdSubdirectories[bookDirPath] = true
+			}
+
+			for _, link := range b.downloadLinks {
+				// lastSlashIndex := strings.LastIndex(url, "/")
+				// bookFilePath := path.Join(bookDirPath, url[lastSlashIndex:])
+				updateLinkDatabase(b.url, link, b.category)
+			}
+
+		case <-quitChan:
+			log.Printf("QUIT done processing books")
+			return // todo rethink?
+		}
+	}
+}
+
+func updateLinkDatabaseHeaders() {
+	if err := ioutil.WriteFile("links.csv", []byte(fmt.Sprintln(`"Page","Link","Category"`)), os.ModePerm); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func updateLinkDatabase(bookPage, link, category string) {
+	f, err := os.OpenFile("links.csv", os.O_APPEND|os.O_CREATE|os.O_WRONLY, os.ModePerm)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer f.Close()
+
+	if _, err := f.WriteString(fmt.Sprintln(fmt.Sprintf(`"%s","%s","%s"`, bookPage, link, category))); err != nil {
+		log.Fatal(err)
+	}
+}
+
+// (...)1a (...)2b (...)3c                    (turn a regex with named captures)
+// => []string{"1a", "2b", "3c'"}             (into a slice of names of named captures)
+// => map["1a"]=1, map["2b"]=2, map["3c"]=3   (and then into a map that maps the name to it's index in the slice)
+func namedCaptureIndexes(r *regexp.Regexp) map[string]int {
+	m := map[string]int{}
+	for i, name := range r.SubexpNames() {
+		if name == "" {
+			continue
+		}
+		m[name] = i
+	}
+	return m
+}
+
+func extractBookCategory(pageSourceCode string, r *regexp.Regexp) string {
+	category := defaultCategoryName
+
+	match := rgxBookCategoryFinder.FindStringSubmatch(pageSourceCode)
+	if len(match) != 0 {
+		namedCapture := namedCaptureIndexes(r)
+		category = match[namedCapture["CATEGORY"]]
+		category = strings.Replace(category, "&amp;", "&", -1)
+	}
+
+	return category
+}
+
+func extractBookDownloadLinks(pageSourceCode string, r *regexp.Regexp) []string {
+	match := r.FindAllStringSubmatch(pageSourceCode, -1)
+	if len(match) == 0 {
+		return []string{}
+	}
+
+	namedCapture := namedCaptureIndexes(r)
+
+	downloadLinks := make([]string, len(match))
+	for i := range match {
+		downloadLinks[i] = match[i][namedCapture["LINK"]]
+	}
+	return downloadLinks
 }
 
 func getSlowModeWaitGroup() *sync.WaitGroup {

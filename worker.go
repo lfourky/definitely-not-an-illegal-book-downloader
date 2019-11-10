@@ -48,8 +48,8 @@ var (
 	workerPool chan *worker
 )
 
-// InitializeWorkers returns a job channel to which we can put data
-func InitializeWorkers(numWorkers, maxWorkCount int) chan Work {
+// initializeWorkers returns a job channel to which we can put data
+func initializeWorkers(numWorkers, maxWorkCount int) chan Work {
 	workerPool = make(chan *worker, numWorkers)
 	for i := 0; i < numWorkers; i++ {
 		w := &worker{work: make(chan Work), workerPool: workerPool}
